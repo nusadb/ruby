@@ -34,8 +34,11 @@ jobs:
       - name: Syntax check
         run: find lib test -name '*.rb' -print0 | xargs -0 -n1 ruby -c
 
+      # Block scalar, not a plain one: an unquoted YAML scalar treats " #" as the start of a
+      # comment, which would silently eat the #{...} interpolation and hand bash a half-open quote.
       - name: Load the driver
-        run: ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loaded on ruby #{RUBY_VERSION}"'
+        run: |
+          ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loaded on ruby #{RUBY_VERSION}"'
 
       # Ruby 3.4 demoted `base64` from a default gem to a bundled one: a bundled gem is present
       # for a plain `ruby -r`, but NOT on the load path of a Bundler-managed app unless that app
