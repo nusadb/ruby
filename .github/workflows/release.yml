@@ -1,0 +1,102 @@
+name: Release
+
+# Publishes the `nusadb` gem to rubygems.org.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Requires the RUBYGEMS_API_KEY secret (a rubygems.org API key with the "Push rubygem" scope).
+# Note that a key from an account whose MFA level is "UI and API" needs an OTP on every push and
+# so cannot be used from CI; use "UI and gem signin", or switch this job to RubyGems trusted
+# publishing (rubygems/configure-trusted-publisher), which needs no secret at all but does need
+# the gem -- or a pending publisher, since `nusadb` is not on rubygems.org yet -- configured
+# against this repository and workflow filename beforehand.
+#
+# A published version is immutable: it can be yanked, but the same version can never be pushed
+# again. So the push is skipped when the version is already on rubygems.org, which makes a
+# release that died partway safe to re-run, by hand, without a new tag.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  # Re-run against a branch to finish a release that failed after the tag. The version comes from
+  # lib/nusadb.rb rather than the tag, and no GitHub Release is cut.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: rubygems
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+
+      # NusaDB::VERSION is the single source of truth -- the gemspec requires lib/nusadb.rb and
+      # reads it. On a tag the two must agree, or the gem would ship under a version nobody tagged.
+      - name: Resolve and verify the version
+        id: version
+        run: |
+          version="$(ruby -Ilib -r nusadb -e 'print NusaDB::VERSION')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$version" ]; then
+              echo "::error::tag v$tag does not match NusaDB::VERSION $version"
+              exit 1
+            fi
+            echo "releasing nusadb $version (from the tag)"
+          else
+            echo "releasing nusadb $version (from lib/nusadb.rb)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The same gates CI runs, re-run here: a tag can point at a commit that never went through
+      # a pull request, and a release is the one push that cannot be taken back.
+      - name: Syntax check
+        run: find lib test -name '*.rb' -print0 | xargs -0 -n1 ruby -c
+
+      - name: Integration tests (skip without a server binary)
+        run: ruby test/test.rb
+
+      - name: Build the gem
+        run: gem build nusadb.gemspec
+
+      - name: Check whether the version is already published
+        id: published
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          url="https://rubygems.org/api/v2/rubygems/nusadb/versions/$VERSION.json"
+          code="$(curl -sSL -o /dev/null -w '%{http_code}' "$url")"
+          case "$code" in
+            200) state=published ;;
+            404) state=absent ;;
+            *)   echo "::error::unexpected HTTP $code from $url"; exit 1 ;;
+          esac
+          echo "nusadb $VERSION -> $state"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Push to rubygems.org
+        if: steps.published.outputs.state == 'absent'
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: gem push nusadb-${{ steps.version.outputs.version }}.gem
+
+  # Only a tag names a release, so a manual dispatch finishing a partial publish does not cut one.
+  github-release:
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag

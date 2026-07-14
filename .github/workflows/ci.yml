@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [master, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # required_ruby_version = '>= 2.7' in the gemspec, so the floor gets tested for real
+        # rather than asserted. ruby/setup-ruby ships no 2.7 build for ubuntu-24.04 (what
+        # `ubuntu-latest` now resolves to), so the floor job pins the newest image that has one.
+        include:
+          - { ruby: '2.7', os: ubuntu-22.04 }
+          - { ruby: '3.1', os: ubuntu-latest }
+          - { ruby: '3.4', os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+
+      # The gem has no build step and no test framework, so a syntax pass over every file is
+      # what stands between a typo and a broken release.
+      - name: Syntax check
+        run: find lib test -name '*.rb' -print0 | xargs -0 -n1 ruby -c
+
+      - name: Load the driver
+        run: ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loaded on ruby #{RUBY_VERSION}"'
+
+      # Ruby 3.4 demoted `base64` from a default gem to a bundled one: a bundled gem is present
+      # for a plain `ruby -r`, but NOT on the load path of a Bundler-managed app unless that app
+      # declares it. So `require 'nusadb'` under Bundler is the check that actually catches a
+      # stdlib require the gem is no longer allowed to make -- which is how every Rails app
+      # using the ActiveRecord adapter loads it.
+      - name: Load the driver under Bundler
+        run: |
+          printf "source 'https://rubygems.org'\ngemspec\n" > Gemfile
+          bundle install
+          bundle exec ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loaded under bundler"'
+          rm -f Gemfile Gemfile.lock
+
+      # The tests boot a real `nusadb-server` binary. It is not present in this repository, and
+      # they are written to skip (not fail) when they cannot find it, so this is a check that the
+      # harness still loads and runs against the current driver API -- not a check of the server.
+      - name: Integration tests (skip without a server binary)
+        run: ruby test/test.rb
+
+  # The ActiveRecord adapter is an optional extra: it is not covered by the job above, because
+  # the driver deliberately does not depend on ActiveRecord. Load it against a real ActiveRecord
+  # so the adapter cannot silently rot against the ORM it subclasses.
+  activerecord:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+
+      # Held below 8.0 on purpose. The adapter hooks in as `ConnectionHandling#nusadb_connection`
+      # and calls AbstractAdapter#initialize(connection, logger, config); ActiveRecord 7.2
+      # deprecated that hook and 8.0 removed it, so adapters must now register through
+      # ActiveRecord::ConnectionAdapters.register and build their connection lazily. Pinning to
+      # the window the adapter really supports keeps CI honest -- letting it float to 8.x would
+      # turn "the adapter is broken on modern Rails" into a green tick or a confusing red one.
+      # Supporting 8.x is a change to the adapter, not to this workflow.
+      - name: Install ActiveRecord
+        run: gem install activerecord -v '>= 7.0, < 8.0' --no-document
+
+      - name: Load the adapter
+        run: |
+          ruby -Ilib -e '
+            require "active_record/connection_adapters/nusadb_adapter"
+            adapter = ActiveRecord::ConnectionAdapters::NusaDBAdapter
+            raise "adapter did not define ADAPTER_NAME" unless adapter::ADAPTER_NAME == "NusaDB"
+            raise "nusadb_connection hook is missing" unless
+              ActiveRecord::ConnectionHandling.method_defined?(:nusadb_connection)
+            puts "#{adapter} loaded against activerecord #{ActiveRecord::VERSION::STRING}"
+          '
+
+      - name: ActiveRecord tests (skip without a server binary)
+        run: ruby test/test_activerecord.rb
+
+  # A release builds and pushes from this same gemspec, so build it on every push: a gemspec that
+  # RubyGems would reject, or a file list that quietly drops the ActiveRecord adapter, should fail
+  # here rather than at tag time.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+
+      - name: Build the gem
+        run: gem build nusadb.gemspec
+
+      # spec.files is a Dir[] glob, so a file can be added to the repo and silently left out of the
+      # gem. Read what the built .gem actually carries, not what the gemspec claims it would.
+      - name: Verify the packaged contents
+        run: |
+          ruby -rrubygems/package -e '
+            gem = Dir["nusadb-*.gem"].first or abort "no .gem was built"
+            contents = Gem::Package.new(gem).contents
+            puts "#{gem} carries:", contents.map { |f| "  #{f}" }
+
+            required = Dir["lib/**/*.rb"] + ["README.md"]
+            missing = required - contents
+            missing.each do |file|
+              puts "::error::#{file} is in the repository but missing from #{gem} (check spec.files)"
+            end
+            abort unless missing.empty?
+          '
+
+      # Installing the built artifact -- not the working tree -- is the last thing that can catch
+      # a gem that resolves or loads only because `-Ilib` was papering over it.
+      - name: Install the built gem and load it
+        run: |
+          gem install ./nusadb-*.gem --no-document
+          cd /tmp
+          ruby -e 'require "nusadb"; puts "installed gem loads: nusadb #{NusaDB::VERSION}"'

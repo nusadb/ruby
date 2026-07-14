@@ -2,19 +2,25 @@
 
 require 'openssl'
 require 'securerandom'
-require 'base64'
 
 module NusaDB
   # Client-side SCRAM-SHA-256 (RFC 5802 / RFC 7677), docs/wire-protocol.md §7.2.
   # Uses Ruby's bundled OpenSSL / SecureRandom — no gems.
+  #
+  # Base64 goes through Array#pack / String#unpack1 rather than the `base64` library, which
+  # `strict_encode64` / `strict_decode64` are themselves thin wrappers over ("m0" is strict:
+  # no line breaks, and decoding rejects malformed input with ArgumentError). Ruby 3.4 demoted
+  # `base64` from a default gem to a bundled one, so `require 'base64'` raises LoadError under
+  # Bundler unless the app declares it — which every Rails app using the ActiveRecord adapter
+  # would have to. The core methods keep the gem genuinely dependency-free.
   class Scram
     GS2_HEADER = 'n,,'
-    CHANNEL_BINDING = Base64.strict_encode64(GS2_HEADER)
+    CHANNEL_BINDING = [GS2_HEADER].pack('m0')
 
     attr_reader :client_first_bare, :full_client_first
 
     def initialize(user)
-      nonce = Base64.strict_encode64(SecureRandom.random_bytes(18))
+      nonce = [SecureRandom.random_bytes(18)].pack('m0')
       @client_first_bare = "n=#{user},r=#{nonce}"
       @full_client_first = GS2_HEADER + @client_first_bare
       @expected_signature = ''
@@ -30,7 +36,7 @@ module NusaDB
 
         case key
         when 'r' then combined_nonce = value
-        when 's' then salt = Base64.strict_decode64(value)
+        when 's' then salt = value.unpack1('m0')
         when 'i' then iterations = value.to_i
         end
       end
@@ -46,10 +52,10 @@ module NusaDB
       auth_message = "#{@client_first_bare},#{server_first},#{without_proof}"
       client_sig = hmac(stored_key, auth_message)
       proof = xor(client_key, client_sig)
-      final = "#{without_proof},p=#{Base64.strict_encode64(proof)}"
+      final = "#{without_proof},p=#{[proof].pack('m0')}"
 
       server_key = hmac(salted, 'Server Key')
-      @expected_signature = Base64.strict_encode64(hmac(server_key, auth_message))
+      @expected_signature = [hmac(server_key, auth_message)].pack('m0')
       final
     end
 
