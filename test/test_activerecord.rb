@@ -6,9 +6,7 @@
 
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 
-require "socket"
-require "tmpdir"
-require "fileutils"
+require_relative "server"
 
 begin
   require "active_record"
@@ -18,60 +16,13 @@ rescue LoadError
   HAVE_AR = false
 end
 
-REPO_ROOT = File.expand_path("../../..", __dir__)
-
-def server_binary
-  bases = [ENV["CARGO_TARGET_DIR"], File.join(REPO_ROOT, "target")].compact
-  names = Gem.win_platform? ? ["nusadb-server.exe"] : ["nusadb-server"]
-  bases.each do |base|
-    %w[debug release].each do |profile|
-      names.each do |name|
-        path = File.join(base, profile, name)
-        return path if File.exist?(path)
-      end
-    end
-  end
-  nil
-end
-
-def free_port
-  s = TCPServer.new("127.0.0.1", 0)
-  port = s.addr[1]
-  s.close
-  port
-end
-
-def wait_ready(port)
-  deadline = Time.now + 15
-  while Time.now < deadline
-    begin
-      TCPSocket.new("127.0.0.1", port).close
-      return
-    rescue SystemCallError
-      sleep 0.1
-    end
-  end
-  raise "server not ready"
-end
-
-def with_server
-  bin = server_binary
-  if bin.nil?
-    warn "SKIP: nusadb-server binary not found"
+def with_server(&block)
+  unless TestServer.available?
+    warn "SKIP: #{TestServer.unavailable_reason}"
     return
   end
-  port = free_port
-  dir = Dir.mktmpdir("nusadb-ar-")
-  pid = spawn({ "RUST_LOG" => "error" }, bin, "--listen", "127.0.0.1:#{port}", "--data-dir", dir,
-              out: File::NULL, err: File::NULL)
-  wait_ready(port)
-  yield port
-ensure
-  if pid
-    Process.kill("KILL", pid)
-    Process.wait(pid)
-  end
-  FileUtils.remove_entry(dir) if dir && File.directory?(dir)
+
+  TestServer.with(&block)
 end
 
 passed = 0
