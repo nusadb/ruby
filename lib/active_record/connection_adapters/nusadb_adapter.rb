@@ -10,6 +10,14 @@
 # Values are inlined (prepared_statements is off), so the server sees plain SQL with constant
 # LIMIT/OFFSET and no bind markers.
 
+# ActiveSupport 7.0 and older reach for ::Logger without requiring it, having long got away with it
+# because concurrent-ruby -- which they load first -- used to require it for them. concurrent-ruby
+# 1.3.5 stopped, so `require "active_record"` on that combination dies with `uninitialized constant
+# ActiveSupport::LoggerThreadSafeLevel::Logger`, and a user on Rails 7.0 with an up-to-date
+# concurrent-ruby cannot load this adapter at all. This file is typically the first thing to require
+# active_record, so this is the place to fix it. A no-op on 7.1+, which requires logger itself.
+require "logger"
+
 require "active_record"
 require "active_record/connection_adapters/abstract_adapter"
 require "nusadb"
