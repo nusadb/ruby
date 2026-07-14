@@ -4,76 +4,21 @@
 # Run: ruby drivers/ruby/test/test.rb   (after `cargo build -p nusadb-server`).
 
 require 'socket'
-require 'tmpdir'
+require_relative 'server'
 require_relative '../lib/nusadb'
 
-REPO_ROOT = File.expand_path('../../..', __dir__)
-
-def server_binary
-  bases = []
-  env = ENV['CARGO_TARGET_DIR']
-  bases << env if env && !env.empty?
-  bases << File.join(REPO_ROOT, 'target')
-  names = Gem.win_platform? ? ['nusadb-server.exe'] : ['nusadb-server']
-  bases.each do |base|
-    %w[debug release].each do |profile|
-      names.each do |name|
-        path = File.join(base, profile, name)
-        return path if File.exist?(path)
-      end
-    end
-  end
-  nil
-end
-
-def free_port
-  server = TCPServer.new('127.0.0.1', 0)
-  port = server.addr[1]
-  server.close
-  port
-end
-
-def wait_ready(port)
-  deadline = Time.now + 15
-  while Time.now < deadline
-    begin
-      TCPSocket.new('127.0.0.1', port).close
-      return
-    rescue SystemCallError
-      sleep 0.1
-    end
-  end
-  raise "server on port #{port} did not become ready"
+unless TestServer.available?
+  warn "SKIP: #{TestServer.unavailable_reason}"
+  exit 0
 end
 
 def start_server(*extra)
-  bin = server_binary
-  if bin.nil?
-    warn 'SKIP: nusadb-server binary not found; run `cargo build -p nusadb-server`'
-    exit 0
-  end
-  port = free_port
-  dir = Dir.mktmpdir('nusadb-ruby-')
-  pid = spawn(
-    { 'RUST_LOG' => 'error' },
-    bin, '--listen', "127.0.0.1:#{port}", '--data-dir', dir,
-    *extra,
-    out: File::NULL, err: File::NULL
-  )
-  wait_ready(port)
-  { pid: pid, port: port, dir: dir }
+  TestServer.start(*extra)
 end
 
 def stop_server(server)
-  Process.kill('KILL', server[:pid])
-  Process.wait(server[:pid])
-rescue Errno::ESRCH, Errno::ECHILD
-  # already gone
-ensure
-  FileUtils.remove_entry(server[:dir]) if File.directory?(server[:dir])
+  TestServer.stop(server)
 end
-
-require 'fileutils'
 
 $passed = 0
 $failed = 0

@@ -1,5 +1,13 @@
 name: CI
 
+# Checks the code, not the database: nothing here talks to a server. This repository ships the
+# driver alone and cannot build a `nusadb-server`, so the suites under test/ are run by hand
+# (they boot a real server -- see test/server.rb) rather than pretended at in CI.
+#
+# What CI can prove without one, it proves for real: every file parses on every Ruby the gemspec
+# claims, the driver loads (including under Bundler), the ActiveRecord adapter is resolvable the way
+# ActiveRecord itself resolves it, and the gem that would be pushed builds, packages and installs.
+
 on:
   push:
     branches: [master, 'ci/**']
@@ -15,9 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # required_ruby_version = '>= 2.7' in the gemspec, so the floor gets tested for real
-        # rather than asserted. ruby/setup-ruby ships no 2.7 build for ubuntu-24.04 (what
-        # `ubuntu-latest` now resolves to), so the floor job pins the newest image that has one.
+        # required_ruby_version = '>= 2.7' in the gemspec, so the floor gets tested for real rather
+        # than asserted. ruby/setup-ruby ships no 2.7 build for ubuntu-24.04 (what `ubuntu-latest`
+        # now resolves to), so the floor job pins the newest image that has one.
         include:
           - { ruby: '2.7', os: ubuntu-22.04 }
           - { ruby: '3.1', os: ubuntu-latest }
@@ -29,19 +37,22 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby }}
 
-      # The gem has no build step and no test framework, so a syntax pass over every file is
-      # what stands between a typo and a broken release.
+      # The gem has no build step and no test framework, so a syntax pass over every file is what
+      # stands between a typo and a broken release.
       - name: Syntax check
         run: find lib test -name '*.rb' -print0 | xargs -0 -n1 ruby -c
 
+      # Block scalar, not a plain one: an unquoted YAML scalar treats " #" as the start of a
+      # comment, which would silently eat the #{...} interpolation and hand bash a half-open quote.
       - name: Load the driver
-        run: ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loaded on ruby #{RUBY_VERSION}"'
+        run: |
+          ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loaded on ruby #{RUBY_VERSION}"'
 
-      # Ruby 3.4 demoted `base64` from a default gem to a bundled one: a bundled gem is present
-      # for a plain `ruby -r`, but NOT on the load path of a Bundler-managed app unless that app
-      # declares it. So `require 'nusadb'` under Bundler is the check that actually catches a
-      # stdlib require the gem is no longer allowed to make -- which is how every Rails app
-      # using the ActiveRecord adapter loads it.
+      # Ruby 3.4 demoted `base64` from a default gem to a bundled one: a bundled gem is present for
+      # a plain `ruby -r`, but NOT on the load path of a Bundler-managed app unless that app declares
+      # it. So `require 'nusadb'` under Bundler is the check that actually catches a stdlib require
+      # the gem is no longer allowed to make -- which is how every Rails app using the ActiveRecord
+      # adapter loads it.
       - name: Load the driver under Bundler
         run: |
           printf "source 'https://rubygems.org'\ngemspec\n" > Gemfile
@@ -49,47 +60,61 @@ jobs:
           bundle exec ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loaded under bundler"'
           rm -f Gemfile Gemfile.lock
 
-      # The tests boot a real `nusadb-server` binary. It is not present in this repository, and
-      # they are written to skip (not fail) when they cannot find it, so this is a check that the
-      # harness still loads and runs against the current driver API -- not a check of the server.
-      - name: Integration tests (skip without a server binary)
-        run: ruby test/test.rb
-
-  # The ActiveRecord adapter is an optional extra: it is not covered by the job above, because
-  # the driver deliberately does not depend on ActiveRecord. Load it against a real ActiveRecord
-  # so the adapter cannot silently rot against the ORM it subclasses.
+  # The ActiveRecord adapter is an optional extra -- the driver deliberately does not depend on
+  # ActiveRecord -- so it gets its own job, against real ActiveRecord releases.
+  #
+  # The versions are not decoration. ActiveRecord changed the adapter contract twice across this
+  # range, in ways a single pinned version would hide entirely:
+  #
+  #   7.2  adapters are resolved from a registry (the <adapter>_connection hook is deprecated, and
+  #        8.0 deletes it); the connection is opened lazily by #connect; quoting moves onto the
+  #        adapter class; and the internal read path switches to #internal_exec_query.
+  #   8.1  Column.new takes +cast_type+ as its second positional argument -- 8.0 does NOT, so 8.x
+  #        cannot be treated as a single target.
+  #
+  # ActiveRecord 8 requires Ruby 3.2+, hence the pairing.
   activerecord:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { ruby: '3.1', activerecord: '7.0.6' }   # legacy: the <adapter>_connection hook
+          - { ruby: '3.1', activerecord: '7.2.2.2' } # registry + lazy connect + class-level quoting
+          - { ruby: '3.4', activerecord: '8.0.3' }   # Rails 8, old Column signature
+          - { ruby: '3.4', activerecord: '8.1.3' }   # Rails 8.1, Column takes cast_type
     steps:
       - uses: actions/checkout@v4
 
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.1'
+          ruby-version: ${{ matrix.ruby }}
 
-      # Held below 8.0 on purpose. The adapter hooks in as `ConnectionHandling#nusadb_connection`
-      # and calls AbstractAdapter#initialize(connection, logger, config); ActiveRecord 7.2
-      # deprecated that hook and 8.0 removed it, so adapters must now register through
-      # ActiveRecord::ConnectionAdapters.register and build their connection lazily. Pinning to
-      # the window the adapter really supports keeps CI honest -- letting it float to 8.x would
-      # turn "the adapter is broken on modern Rails" into a green tick or a confusing red one.
-      # Supporting 8.x is a change to the adapter, not to this workflow.
-      - name: Install ActiveRecord
-        run: gem install activerecord -v '>= 7.0, < 8.0' --no-document
+      - name: Install ActiveRecord ${{ matrix.activerecord }}
+        run: gem install activerecord -v '${{ matrix.activerecord }}' --no-document
 
-      - name: Load the adapter
+      # Loading is not enough: an adapter ActiveRecord cannot *find* still loads perfectly well. On
+      # 7.2+ this asserts the registry resolves "nusadb" (an unregistered adapter raises
+      # AdapterNotFound before a connection is ever attempted), and that quoting answers at the class
+      # level, where ActiveRecord asks for it before any connection exists.
+      - name: Resolve the adapter the way ActiveRecord does
         run: |
           ruby -Ilib -e '
             require "active_record/connection_adapters/nusadb_adapter"
-            adapter = ActiveRecord::ConnectionAdapters::NusaDBAdapter
-            raise "adapter did not define ADAPTER_NAME" unless adapter::ADAPTER_NAME == "NusaDB"
-            raise "nusadb_connection hook is missing" unless
-              ActiveRecord::ConnectionHandling.method_defined?(:nusadb_connection)
-            puts "#{adapter} loaded against activerecord #{ActiveRecord::VERSION::STRING}"
-          '
 
-      - name: ActiveRecord tests (skip without a server binary)
-        run: ruby test/test_activerecord.rb
+            expected = ActiveRecord::ConnectionAdapters::NusaDBAdapter
+            if ActiveRecord::ConnectionAdapters.respond_to?(:register)
+              resolved = ActiveRecord::ConnectionAdapters.resolve("nusadb")
+              raise "registry resolved #{resolved}, expected #{expected}" unless resolved == expected
+              raise "class-level quoting is missing" unless expected.quote_column_name("a b") == %("a b")
+              how = "registry"
+            else
+              raise "the nusadb_connection hook is missing" unless
+                ActiveRecord::ConnectionHandling.method_defined?(:nusadb_connection)
+              how = "connection hook"
+            end
+            puts "#{expected} resolvable via #{how} on activerecord #{ActiveRecord::VERSION::STRING}"
+          '
 
   # A release builds and pushes from this same gemspec, so build it on every push: a gemspec that
   # RubyGems would reject, or a file list that quietly drops the ActiveRecord adapter, should fail
@@ -123,8 +148,8 @@ jobs:
             abort unless missing.empty?
           '
 
-      # Installing the built artifact -- not the working tree -- is the last thing that can catch
-      # a gem that resolves or loads only because `-Ilib` was papering over it.
+      # Installing the built artifact -- not the working tree -- is the last thing that can catch a
+      # gem that resolves or loads only because `-Ilib` was papering over it.
       - name: Install the built gem and load it
         run: |
           gem install ./nusadb-*.gem --no-document

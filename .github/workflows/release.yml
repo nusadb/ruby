@@ -55,13 +55,15 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # The same gates CI runs, re-run here: a tag can point at a commit that never went through
-      # a pull request, and a release is the one push that cannot be taken back.
+      # The same gates CI runs, re-run here: a tag can point at a commit that never went through a
+      # pull request, and a release is the one push that cannot be taken back. (The suites under
+      # test/ need a real server and so are not part of this -- see the note at the top of ci.yml.)
       - name: Syntax check
         run: find lib test -name '*.rb' -print0 | xargs -0 -n1 ruby -c
 
-      - name: Integration tests (skip without a server binary)
-        run: ruby test/test.rb
+      - name: Load the driver
+        run: |
+          ruby -Ilib -r nusadb -e 'puts "nusadb #{NusaDB::VERSION} loads"'
 
       - name: Build the gem
         run: gem build nusadb.gemspec
